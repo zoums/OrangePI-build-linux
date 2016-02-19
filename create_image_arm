@@ -1,0 +1,446 @@
+#!/bin/bash
+
+# 最后一次更新: 2016-02-19
+# *****************************************************
+# !! 记住设定安装的程序在文件 "second-stage *
+# *****************************************************
+
+if [ "$(id -u)" != "0" ]; then
+   echo "Script must be run as root !"
+   exit 0
+fi
+
+echo ""
+date
+echo -e "\033[36m======================================================="
+echo -e "为OrangePI构建 Ubuntu/Debian 的SD卡文件系统"
+echo -e "=======================================================\033[37m"
+echo ""
+
+_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+cd $_DIR
+
+. params.sh
+
+#===================================================================
+
+# ============================================
+if [ "${distro}" = "" ]; then
+    echo "必须指定发行版。"
+    exit 0
+fi
+if [ "${repo}" = "" ]; then
+    echo "必须指定安装源。"
+    exit 0
+fi
+# ============================================
+
+#===================================================================
+
+
+_excode=0
+
+# **** 显示进度 *******
+proc_wait() {
+    spin='-\|/'
+
+    i=0
+    while kill -0 $1 2>/dev/null
+    do
+      i=$(( (i+1) %4 ))
+      printf "\r$2 ${spin:$i:1}"
+      sleep .1
+    done
+    _excode=$?
+
+    if [ $_excode -eq 0 ]
+    then
+      printf "\rOK.                        \n"
+    else
+      printf "\rERROR.                     \n"
+    fi
+}
+# **************************
+
+if [ "${_format}" = "btrfs" ] ; then
+    _mntopt="-o compress-force=lzo"
+else
+    _mntopt=""
+fi
+
+# ===================
+. format.sh
+# ===================
+
+if [ "${odir}" = "" ] || [ "${bootdir}" = "" ]; then
+    echo "发生致命错误."
+    exit 1
+fi
+
+
+# ===================
+# 准备目录
+# ===================
+if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+    if [ ! -d $bootdir ]; then
+	mkdir -p $bootdir
+    fi
+    rm $bootdir/* > /dev/null 2>&1
+    sync
+    umount $bootdir > /dev/null 2>&1
+fi
+
+
+if [ ! -d $odir ]; then
+    mkdir -p $odir
+fi
+rm -rf $odir/* > /dev/null 2>&1
+sync
+
+umount $odir > /dev/null 2>&1
+sleep 1
+
+# ===========================================
+# 如果使用SD卡镜像，就挂载分区
+# ===========================================
+if [ ! "${sdcard}" = "" ]; then
+    echo ""
+    echo "挂载SD卡分区..."
+
+    if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+	if ! mount ${sdcard}1 $bootdir; then
+	    echo "挂在分区发生错误..."
+	    exit 1
+	fi
+	if ! mount ${_mntop} ${sdcard}2 $odir; then
+	    echo "挂在分区发生错误..."
+	    umount $bootdir
+	    exit 1
+	fi
+        echo "SD卡分区已挂载到到 $odir & $bootdir"
+    else
+	if ! mount ${_mntop} ${sdcard}1 $odir; then
+	    echo "挂在分区发生错误..."
+            if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+	        umount $bootdir
+	    fi
+	    exit 1
+	fi
+	echo "SD卡分区已挂载到到 $odir"
+    fi
+fi
+
+#===================================================================================================================
+# ========================
+# DEBOOTSTRAP LINUX 构建
+# ========================
+echo ""
+
+touch $odir/_$distro
+
+echo "DEBOOTSTRAP, 第一步部署系统根文件"
+if [ "${raspbian}" = "yes" ] ; then
+  debootstrap --arch armhf --foreign --no-check-gpg --include=ca-certificates --verbose --include=wget ${distro} $odir $repo > /dev/null 2>&1 &
+else
+  debootstrap --arch armhf --foreign --verbose --variant=minbase --include=wget ${distro} $odir $repo > /dev/null 2>&1 &
+fi
+pid=$!
+proc_wait $pid "please wait"
+if [ $_excode -ne 0 ]; then
+    echo "DEBOOTSTRAP发生错误!"
+    exit 0
+fi
+
+# ***************************
+# 创建新的sources.list安装源文件:
+# ***************************
+echo "Creating \"sources.list\""
+case ${distro} in
+trusty|utopic|precise|vivid|wily*)
+cat > $odir/sources.list << _EOF_
+deb $repo/ $distro main restricted universe multiverse
+deb-src $repo/ $distro main restricted universe multiverse
+deb $repo/ $distro-updates main restricted universe multiverse
+deb-src $repo/ $distro-updates main restricted universe multiverse
+deb $repo/ $distro-security main restricted universe multiverse
+deb $repo/ $distro-backports main restricted universe multiverse
+
+_EOF_
+;;*)
+if [ "${raspbian}" = "yes" ] ; then
+cat > $odir/sources.list << _EOF_
+deb $repo/ $distro main contrib non-free
+deb-src $repo/ $distro main contrib non-free
+
+_EOF_
+else
+cat > $odir/sources.list << _EOF_
+deb $repo/ $distro main contrib non-free
+deb-src $repo/ $distro main contrib non-free
+
+deb $repo/ $distro-updates main contrib non-free
+deb-src $repo/ $distro-updates main contrib non-free
+
+deb $repo/ $distro-backports main contrib non-free
+deb-src $repo/ $distro-backports main contrib non-free
+
+_EOF_
+fi
+;;esac
+
+#if [ ! "${ONLY_BASE}" = "yes" ] ; then
+#    echo "deb http://debian.xypron.de/ unstable/all/" >> $odir/sources.list
+#    echo "deb http://debian.xypron.de/ unstable/armhf/" >> $odir/sources.list
+#fi
+
+
+# ==============================================
+# 创建必须的目录以及复制一些文件
+# ==============================================
+mkdir -p $odir/etc/default > /dev/null 2>&1
+if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+    mkdir -p $odir/media/boot
+fi
+mkdir -p $odir/usr/local/bin
+mkdir -p $odir/usr/bin > /dev/null 2>&1
+
+cp /etc/timezone $odir/etc
+cp /usr/bin/qemu-arm-static $odir/usr/bin
+cp second-stage $odir/second-stage
+cp params.sh $odir/params.sh
+if [ ! "${ONLY_BASE}" = "yes" ] ; then
+    cp wallpaper.png $odir/ > /dev/null 2>&1
+fi
+
+# =====================================================================================
+# 执行 debootstram 第二步及安装基本系统
+# =====================================================================================
+
+# ********************************************************************************
+# *** 如果在arm平台上部署 (OrangePI) 使用没有 "qemu-arm-static" 运行 !!! ****
+# ********************************************************************************
+if ! chroot $odir /bin/bash /second-stage; then
+#if ! chroot $odir /usr/bin/qemu-arm-static -cpu cortex-a9 /bin/bash /second-stage; then
+    mv $odir/install.log . > /dev/null 2>&1
+    echo "================================================"
+    echo "second-stage第二步出错, 安装没有完成."
+    echo "================================================"
+    exit 1
+fi
+
+if [ ! -f $odir/_OK_ ]; then
+    mv $odir/install.log . > /dev/null 2>&1
+    echo "================================================"
+    echo "second-stage第二步出错, 安装没有完成."
+    echo "================================================"
+    exit 1
+fi
+
+#======================================================================================
+
+rm $odir/_OK_ > /dev/null 2>&1
+rm $odir/second-stage > /dev/null 2>&1
+rm $odir/params.sh > /dev/null 2>&1
+mv $odir/install.log ./install-${distro}.log > /dev/null 2>&1
+
+# === 复制脚步 ========================
+cp fs_resize $odir/usr/local/bin
+cp update_boot.sh $odir/usr/local/bin
+cp install_to_emmc $odir/usr/local/bin
+if [ ! "${ONLY_BASE}" = "yes" ] ; then
+    cp install_lxde_desktop $odir/usr/local/bin
+    cp install_mate_desktop $odir/usr/local/bin
+    cp install_xfce_desktop $odir/usr/local/bin
+fi
+# =========================================
+
+# === 复制内核, 模块 & 脚本 =============================================
+mkdir -p $odir/boot > /dev/null 2>&1
+mkdir -p $odir/boot > /dev/null 2>&1
+mkdir -p $odir/boot > /dev/null 2>&1
+
+rm -r $odir/boot/* > /dev/null 2>&1
+cp orange/uImage_OPI* $odir/boot > /dev/null 2>&1
+cp orange/boot0_OPI.fex $odir/boot > /dev/null 2>&1
+cp orange/u-boot_OPI*.fex $odir/boot > /dev/null 2>&1
+cp install_* $odir/usr/local/bin > /dev/null 2>&1
+cp fs_resize $odir/usr/local/bin > /dev/null 2>&1
+
+if [ "${3}" = "opi-2" ] || [ "${4}" = "opi-2" ]; then
+    cp orange/uImage_OPI-2 $odir/boot/uImage > /dev/null 2>&1
+    cp orange/script.bin.OPI-2_* $odir/boot > /dev/null 2>&1
+    if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+        cp orange/uImage_OPI-2 $bootdir/uImage > /dev/null 2>&1
+        cp orange/script.bin.OPI-2_1080p60_hdmi $bootdir/script.bin > /dev/null 2>&1
+        cp orange/script.bin.OPI-2_* $bootdir > /dev/null 2>&1
+    fi
+elif [ "${3}" = "opi-pc" ] || [ "${4}" = "opi-pc" ]; then
+    cp orange/uImage_OPI-2 $odir/boot/uImage > /dev/null 2>&1
+    cp orange/script.bin.OPI-PC_* $odir/boot > /dev/null 2>&1
+    if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+        cp orange/uImage_OPI-2 $bootdir/uImage > /dev/null 2>&1
+        cp orange/script.bin.OPI-PC_1080p60_hdmi $bootdir/script.bin > /dev/null 2>&1
+        cp orange/script.bin.OPI-PC_* $bootdir > /dev/null 2>&1
+    fi
+elif [ "${3}" = "opi-plus" ] || [ "${4}" = "opi-plus" ]; then
+    cp orange/uImage_OPI-PLUS $odir/boot/uImage > /dev/null 2>&1
+    cp orange/script.bin.OPI-PLUS_* $odir/boot > /dev/null 2>&1
+    if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+        cp orange/uImage_OPI-PLUS $bootdir/uImage > /dev/null 2>&1
+        cp orange/script.bin.OPI-PLUS_1080p60_hdmi $bootdir/script.bin > /dev/null 2>&1
+        cp orange/script.bin.OPI-PLUS_* $bootdir > /dev/null 2>&1
+    fi
+else
+    cp orange/uImage_OPI-2 $odir/boot/uImage > /dev/null 2>&1
+    cp orange/script.bin.OPI-* $odir/boot > /dev/null 2>&1
+    if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+        cp orange/uImage_OPI-2 $bootdir/uImage > /dev/null 2>&1
+        cp orange/uImage_OPI* $bootdir > /dev/null 2>&1
+        cp orange/script.bin.OPI-* $bootdir > /dev/null 2>&1
+        cp orange/script.bin.OPI-2_720p60_hdmi $bootdir/script.bin > /dev/null 2>&1
+    fi
+fi
+
+cp -rf orange/lib/modules $odir/lib > /dev/null 2>&1
+cp -rf orange/lib/firmware $odir/lib > /dev/null 2>&1
+chown -R root:root $odir/lib/* > /dev/null 2>&1
+
+# ================================================================================
+
+sync
+
+rm -rf $odir/dev/*
+rm -rf $odir/proc/*
+rm -rf $odir/run/*
+rm -rf $odir/sys/*
+rm -rf $odir/tmp/*
+
+echo ""
+
+# ***************
+# 创建 fstab
+# ***************
+echo "Creating \"fstab\""
+echo "# OrangePI fstab" > $odir/etc/fstab
+if [ "${_format}" = "btrfs" ] ; then
+    echo "/dev/mmcblk0p2  /  btrfs subvolid=0,noatime,nodiratime,compress=lzo  0 1" >> $odir/etc/fstab
+else
+    echo "/dev/mmcblk0p2  /  ext4  errors=remount-ro,noatime,nodiratime  0 1" >> $odir/etc/fstab
+fi
+echo "/dev/mmcblk0p1  /media/boot  vfat  defaults  0 0" >> $odir/etc/fstab
+echo "tmpfs /tmp  tmpfs nodev,nosuid,mode=1777  0 0" >> $odir/etc/fstab
+
+sync
+
+# ================================================
+# 如果是创建镜像则卸载以及创建最后镜像
+# ================================================
+if [ ! "${sdcard}" = "" ]; then
+    if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+      if ! umount -l $bootdir; then
+	  echo "卸载EXT4分区时发生错误。"
+	  exit 0
+      fi
+      rm -rf $bootdir/* > /dev/null 2>&1
+      rmdir $bootdir > /dev/null 2>&1
+    fi
+    if ! umount -l $odir; then
+	echo "卸载EXT4分区时发生错误。"
+	exit 0
+    fi
+    rm -rf $odir/* > /dev/null 2>&1
+    rmdir $odir > /dev/null 2>&1
+    sync
+
+    echo "创建SD卡镜像..."
+    dd if=${sdcard}u of=${sdcard} > /dev/null 2>&1
+    if [ -f ${sdcard}1 ]; then
+        dd if=${sdcard}1 of=${sdcard} bs=1M conv=notrunc oflag=append > /dev/null 2>&1
+    fi
+    if [ -f ${sdcard}2 ]; then
+        dd if=${sdcard}2 of=${sdcard} bs=1M conv=notrunc oflag=append > /dev/null 2>&1
+    fi
+
+    if [ "${_compress}" = "yes" ]; then
+        echo "生成镜像..."
+        xz -z -k -9 -f -v $sdcard
+        md5sum $sdcard > $sdcard.md5sum
+        md5sum $sdcard.xz > $sdcard.xz.md5sum
+    fi
+fi
+
+if [ "${_directsd}" = "yes" ] ; then
+    if ! umount $odir; then
+	echo "卸载EXT4分区时发生错误。"
+    fi
+fi
+
+echo ""
+date
+echo ""
+echo "************************************************************"
+echo "部署完成。"
+echo ""
+if [ ! "${sdcard}" = "" ]; then
+    echo "你拥有了可在OrangePI上启动的镜像“” \"${sdcard}\"."
+    echo "使用dd命令写入SD卡。"
+    echo "  例如 sudo dd if=$sdcard of=/dev/<your_sdcard> bs=1M"
+else
+    if [ "${_directsd}" = "yes" ] ; then
+        echo "你有 OrangePI 的 $distro 部署在 $image_name."
+    else
+	if [ ! "${_boot_on_ext4}" = "yes" ] ; then
+	    echo "请复制来自 $bootdir 的文件到SD卡启动分区"
+	    echo "  例如  cp $bootdir/* <path_to_sdcard_boot_mount>"
+	    echo "  以及同步 $odir 到SD卡的EXT4分区."
+	    echo "  例如 sudo rsync -r -t -p -o -g -x -v --progress --delete -l -H -D --numeric-ids -s $PWD/$odir/ <path_to_sdcard_ext4_mount>/"
+	else
+	    echo "同步来自 $odir 到SD卡的EXT4分区"
+	    echo "  e.g. sudo rsync -r -t -p -o -g -x -v --progress --delete -l -H -D --numeric-ids -s $PWD/$odir/ <path_to_sdcard_ext4_mount>/"
+	fi
+	echo ""
+	echo "或者用如下命令创建镜像:"
+	echo "  sudo ./image_from_dir $odir <DEVICE|IMAGE>"
+    fi
+    echo ""
+    echo "你能 chroot 运行进去 \"$odir\" 来进行修改:"
+    if [ "${_directsd}" = "yes" ] ; then
+        echo "  sudo mount $image_name $odir"
+    fi
+    echo "  chroot $odir /bin/bash "
+fi
+echo ""
+echo -e "\033[36m"
+echo "************************************************************"
+echo "* 在OrangePI启动部署的镜像后:                                 *"
+echo "* -------------------------------------------------------- *"
+echo "* 扩展SD卡所有分区（记得执行后重启）:                           *"
+echo "*   sudo fs_resize                                         *"
+echo "* -------------------------------------------------------- *"
+echo "* 去改变板子类型 / 更新请执行:                                 *"
+echo "*   sudo update_boot.sh                                    *"
+echo "* -------------------------------------------------------- *"
+echo "* 安装到emmc请运行:                                          *"
+echo "*   sudo install_to_emmc                                   *"
+echo "* -------------------------------------------------------- *"
+echo "* 安装桌面环境请执行:                                         *"
+echo "*   sudo install_lxde_desktop                              *"
+echo "*   或者更好的桌面环境 (wily&vivid&jessie)                    *"
+echo "*   sudo install_mate_desktop                              *"
+echo "* 记得在安装桌面环境前执行扩展分区及执行后记得重启（之前执行过了不用）*"
+echo "* -------------------------------------------------------- *"
+echo "* 去修改你的本地设置请执行:                                    *"
+echo "*   sudo dpkg-reconfigure tzdata                           *"
+echo "*   sudo dpkg-reconfigure keyboard-configuration           *"
+echo "*   sudo dpkg-reconfigure console-setup                    *"
+echo "*     # 更改系统的地区请修改：                                 *"
+echo "*     # 这个文件 /etc/default/locale (例如 zh_CN.UTF-8)      *"
+echo "*     # 然后运行:                                           *"
+echo "*   sudo locale-gen <your_locale> (e.g zh_CN.UTF-8)        *"
+echo "*   sudo dpkg-reconfigure locales                          *"
+echo "************************************************************"
+echo -e "\033[37m"
+date
+echo ""
+
+exit 0
